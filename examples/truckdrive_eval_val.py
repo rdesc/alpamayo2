@@ -94,6 +94,7 @@ def run(
     shard_index: int = 0,
     num_frames: int = 4,
     enable_cot: bool = True,
+    save_predictions_path: str | None = None,
 ) -> None:
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
@@ -136,6 +137,7 @@ def run(
 
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     records = []
+    pred_records: list[dict] | None = [] if save_predictions_path else None
     t_start = time.time()
     with open(out_path, "w") as out_f:
         for i, (scene_id, t0) in enumerate(windows, 1):
@@ -170,7 +172,14 @@ def run(
                 metrics["corner_distance"] = truckdrive_metrics.corner_distance(
                     pred_xyz_cpu, pred_rot_cpu, gt_xyz_b, gt_rot_b
                 )
-                cot = extra["cot"][0] if isinstance(extra["cot"], (list, tuple)) else extra["cot"]
+                # extra["cot"] is sometimes a numpy object array rather than a
+                # nested list (observed with num_traj_samples>1); normalize once
+                # so both the jsonl record and the saved predictions get real
+                # text instead of a stringified/dropped array.
+                cot_raw = extra["cot"]
+                if isinstance(cot_raw, np.ndarray):
+                    cot_raw = cot_raw.tolist()
+                cot = cot_raw[0] if isinstance(cot_raw, (list, tuple)) else cot_raw
 
                 record = {
                     "scene_id": scene_id,
@@ -180,6 +189,40 @@ def run(
                     "cot": cot,
                     "status": "ok",
                 }
+
+                if pred_records is not None:
+                    # Same field set/shapes as alpamayo-recipes' predictions.pt
+                    # (evaluate_hf.py / mlp_baseline.py), so this drops into the
+                    # same cross-model comparison tooling: pred_xyz/pred_rot are
+                    # [N=1, K, T, 3]/[N=1, K, T, 3, 3], ego_*_xyz/rot are [1, T, 3]
+                    # (history) / [1, T, 3] (future) -- squeezing the batch dim,
+                    # keeping the N=1 trajectory-group dim. gen_text/cot mirrors
+                    # render_scene_video.py's expected [[text0, ..., textK-1]] shape
+                    # (one list per N-group) when CoT was generated.
+                    cot_list = cot if isinstance(cot, (list, tuple)) else None
+                    pred_records.append(
+                        {
+                            "scene_id": scene_id,
+                            "clip_id": scene_id,
+                            "t0_us": int(round(t0 * 1e6)),
+                            "pred_xyz": pred_xyz_cpu[0],
+                            "pred_rot": pred_rot_cpu[0],
+                            "ego_future_xyz": gt_xyz_b,
+                            "ego_future_rot": gt_rot_b,
+                            "ego_history_xyz": data["ego_history_xyz"][:, -1].cpu(),
+                            "ego_history_rot": data["ego_history_rot"][:, -1].cpu(),
+                            "sample_ade": torch.linalg.norm(
+                                (pred_xyz_cpu - gt_xyz_b[:, None])[..., :2], dim=-1
+                            ).mean(dim=-1)[0],  # [B=1, N=1, K] -> [N=1, K]
+                            "metric/min_ade": metrics["min_ade/by_t=6.4"],
+                            "metric/ade": metrics["ade/by_t=6.4"],
+                            "metric/corner_distance": metrics["corner_distance"],
+                            **{f"metric/{k}": v for k, v in metrics.items()},
+                            "gen_text/cot": cot_list,
+                            "enable_cot": enable_cot,
+                            "num_frames": num_frames,
+                        }
+                    )
             except Exception as exc:  # noqa: BLE001 - one bad window must not kill the run
                 record = {"scene_id": scene_id, "t0_s": t0, "status": "error", "error": repr(exc)}
 
@@ -232,6 +275,11 @@ def run(
     print("Wrote per-window records to", out_path)
     print("Wrote summary to", summary_path)
 
+    if pred_records is not None:
+        os.makedirs(os.path.dirname(os.path.abspath(save_predictions_path)), exist_ok=True)
+        torch.save(pred_records, save_predictions_path)
+        print(f"Wrote {len(pred_records)} prediction records to", save_predictions_path)
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -278,6 +326,14 @@ def main() -> None:
              "(verified to actually empty extra['cot'], not just skip reporting it). "
              "Untested relative to the release checkpoint's trained conditioning.",
     )
+    parser.add_argument(
+        "--save-predictions", default=None,
+        help="Path to dump per-window pred_xyz/pred_rot/gen_text-cot records "
+             "(torch.save, list[dict]) in the same field layout as alpamayo-recipes' "
+             "predictions.pt, for cross-model qualitative comparison. Off by default "
+             "(adds ~nothing to runtime but the tensors are memory-resident until the "
+             "shard finishes, so only turn on for the run(s) you actually want to compare).",
+    )
     args = parser.parse_args()
 
     run(
@@ -298,6 +354,7 @@ def main() -> None:
         shard_index=args.shard_index,
         num_frames=args.num_frames,
         enable_cot=not args.no_cot,
+        save_predictions_path=args.save_predictions,
     )
 
 
