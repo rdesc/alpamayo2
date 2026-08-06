@@ -51,6 +51,10 @@ class Alpamayo2SuperModelOutput(ModelOutput):
 
     loss: torch.FloatTensor | None = None
     logits: torch.FloatTensor | None = None
+    # Detached scalar components of `loss` for logging (trajectory-token loss vs
+    # everything else). `loss` is their sum; these are diagnostics only.
+    loss_future_traj: torch.FloatTensor | None = None
+    loss_others: torch.FloatTensor | None = None
 
 
 class MaskDiscreteTrajectoryLogitsProcessor(LogitsProcessor):
@@ -240,7 +244,12 @@ class Alpamayo2Super(PreTrainedModel):
             labels,
             labels != IGNORE_INDEX,
         ) * self.config.loss_weights.get("others", 1.0)
-        return Alpamayo2SuperModelOutput(loss=future_traj_loss + other_loss, logits=logits)
+        return Alpamayo2SuperModelOutput(
+            loss=future_traj_loss + other_loss,
+            logits=logits,
+            loss_future_traj=future_traj_loss.detach(),
+            loss_others=other_loss.detach(),
+        )
 
     @torch.inference_mode()
     def sample_trajectories_from_data(

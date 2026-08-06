@@ -73,6 +73,40 @@ DEFAULT_VIEW_TO_ALPAMAYO: dict[str, str] = {
 
 _IMAGE_EXTS = (".jpg", ".jpeg", ".png")
 
+# Official TruckDrive devkit split keys (metainfo.json). The three training
+# lists differ only in 3-D *box* annotation style, which trajectory training
+# doesn't use -- all three are trainable. Val/test hold out whole collection
+# batches (scene groups), the devkit's leak protection. Mirrors
+# alpamayo-recipes' ``alpamayo.data.truckdrive._METAINFO_TRAIN_KEYS`` /
+# ``_scenes_from_metainfo`` exactly, so ``split="train"`` here resolves to the
+# identical scene set used to train Alpamayo 1.5 on TruckDrive.
+_METAINFO_TRAIN_KEYS = (
+    "sequentially_labelled_training_scenes",
+    "non_sequentially_labelled_training_scenes",
+    "unlabelled_training_scenes",
+)
+
+
+def scenes_from_metainfo(path: str, split: str) -> list[str]:
+    """Resolve scene IDs for ``split`` from the devkit's official metainfo.json.
+
+    ``split="train"`` is the union of all three training-scene lists (dedup'd,
+    sorted); ``"val"``/``"test"`` are ``validation_scenes``/``test_scenes``.
+    """
+    import json
+
+    with open(path) as f:
+        meta = json.load(f)
+    if split == "train":
+        ids = [s for k in _METAINFO_TRAIN_KEYS for s in meta[k]]
+    elif split == "val":
+        ids = list(meta["validation_scenes"])
+    elif split == "test":
+        ids = list(meta["test_scenes"])
+    else:
+        raise ValueError(f"split={split!r} invalid with metainfo (use 'train'/'val'/'test')")
+    return sorted(set(ids))
+
 
 # --------------------------------------------------------------------------- #
 # Read backends
@@ -341,6 +375,181 @@ def _load_view_frames(
     return frames, np.asarray(frame_ts, dtype=np.float64)
 
 
+def _ego_traj_from_poses(
+    poses: _ScenePoses,
+    scene_id: str,
+    t0_s: float,
+    num_history_steps: int,
+    num_future_steps: int,
+    time_step: float,
+    min_speed_mps: float,
+    standstill_snap_mps: float | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Pose track -> ego-frame ``(hist_xyz, hist_rot, fut_xyz, fut_rot)``.
+
+    Pose-only (no image loads) -- exactly the trajectory ``load_truckdrive_sample``
+    feeds the model, factored out so ``prefilter_tok_recon`` (index-build time,
+    no images) can reuse it. Mirrors alpamayo-recipes'
+    ``TruckDriveDataset._ego_traj``. Shapes: xyz ``(T, 3)``, rot ``(T, 3, 3)``.
+    """
+    hist_offsets = np.array(
+        [-(num_history_steps - 1 - i) * time_step for i in range(num_history_steps)]
+    )
+    fut_offsets = np.array([(i + 1) * time_step for i in range(num_future_steps)])
+    all_offsets = np.concatenate([hist_offsets, fut_offsets])
+    t_window = t0_s + all_offsets
+
+    if t_window[0] < poses.t_min or t_window[-1] > poses.t_max:
+        raise ValueError(
+            f"t0_s={t0_s} leaves the pose timeline [{poses.t_min:.2f}, {poses.t_max:.2f}]s "
+            f"for scene {scene_id} once history/future margins are applied"
+        )
+
+    xyz_w = poses.sample(t_window)
+    yaw_w = _heading_from_positions(xyz_w, time_step, min_speed_mps)
+    rot_w = _rot_z(yaw_w)
+
+    H = num_history_steps
+    t0_xyz = xyz_w[H - 1]
+    t0_rot_inv = rot_w[H - 1].T  # orthonormal -> inverse is transpose
+    xyz_local = (xyz_w - t0_xyz) @ t0_rot_inv.T
+    rot_local = np.einsum("ij,njk->nik", t0_rot_inv, rot_w)
+    hist_xyz, fut_xyz = xyz_local[:H], xyz_local[H:]
+    hist_rot, fut_rot = rot_local[:H], rot_local[H:]
+
+    if standstill_snap_mps is not None:
+        hist_xyz, hist_rot, fut_xyz, fut_rot = _standstill_snap(
+            poses, t0_s, hist_offsets[0], fut_offsets[-1], standstill_snap_mps,
+            hist_xyz, hist_rot, fut_xyz, fut_rot,
+        )
+    return hist_xyz, hist_rot, fut_xyz, fut_rot
+
+
+def prefilter_tok_recon(
+    windows: Sequence[tuple[str, float]],
+    tokenizer: Any,
+    data_root: str = DEFAULT_DATA_ROOT,
+    backend: str = "s3",
+    region: str = "us-east-1",
+    pose_file: str = "poses/gt_trajectory.txt",
+    num_history_steps: int = 16,
+    num_future_steps: int = 64,
+    time_step: float = 0.1,
+    min_speed_mps: float = 0.5,
+    standstill_snap_mps: float | None = 0.5,
+    max_xy_m: float = 1.0,
+    reduce: str = "mean",
+    chunk_size: int = 512,
+    verbose: bool = True,
+) -> list[tuple[str, float]]:
+    """Drop windows whose future round-trips badly through the frozen future
+    trajectory tokenizer (encode -> decode XY error above ``max_xy_m``).
+
+    Pose-only (no image loads); the encode/decode runs vectorised in chunks on
+    CPU. Mirrors alpamayo-recipes' ``TruckDriveDataset._prefilter_tok_recon``
+    exactly (same ``tokenizer.encode(hist_xyz, hist_rot, fut_xyz, fut_rot)`` ->
+    ``tokenizer.decode(hist_xyz, hist_rot, tokens)`` contract, which Alpamayo 2
+    Super's ``DeltaTrajectoryTokenizer`` also implements), so passing this
+    ``max_xy_m``/``reduce`` matches the same filter ``sft_truckdrive.yaml``
+    applies to Alpamayo 1.5's TRAIN split (never applied to val -- dropping val
+    windows would renumber the split and invalidate any hardcoded indices).
+
+    Args:
+        windows: ``(scene_id, t0_s)`` pairs, e.g. from ``enumerate_val_windows``.
+        tokenizer: A future-trajectory tokenizer instance (e.g.
+            ``hydra.utils.instantiate(model_config.future_traj_tokenizer_cfg)``) --
+            deterministic bin-based quantization, no checkpoint weights needed.
+    """
+    if reduce not in ("mean", "max", "median", "p95"):
+        raise ValueError(f"reduce must be mean/max/median/p95, got {reduce!r}")
+
+    be = _make_backend(backend, data_root, region)
+    pose_cache: dict[str, _ScenePoses | None] = {}
+
+    def _poses(scene_id: str) -> _ScenePoses | None:
+        if scene_id not in pose_cache:
+            try:
+                text = be.read_bytes(f"{scene_id}/{pose_file}").decode("utf-8")
+                pose_cache[scene_id] = _ScenePoses(text)
+            except Exception:  # noqa: BLE001 - skip unreadable scenes
+                pose_cache[scene_id] = None
+        return pose_cache[scene_id]
+
+    kept: list[tuple[str, float]] = []
+    errs: list[float] = []
+    n_fail = 0
+    buf: list[tuple[str, float, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+
+    def _flush() -> None:
+        nonlocal n_fail
+        if not buf:
+            return
+        hx = torch.from_numpy(np.stack([b[2] for b in buf])).float()
+        hr = torch.from_numpy(np.stack([b[3] for b in buf])).float()
+        fx = torch.from_numpy(np.stack([b[4] for b in buf])).float()
+        fr = torch.from_numpy(np.stack([b[5] for b in buf])).float()
+        try:
+            with torch.no_grad():
+                tokens = tokenizer.encode(hist_xyz=hx, hist_rot=hr, fut_xyz=fx, fut_rot=fr)
+                rec, _, _ = tokenizer.decode(hist_xyz=hx, hist_rot=hr, tokens=tokens)
+        except Exception:  # noqa: BLE001 - fail-open: a tokenizer failure is a
+            # sign of a pathological window, but don't silently nuke a whole
+            # chunk over it -- keep them and count so it's visible in logs.
+            n_fail += len(buf)
+            kept.extend((b[0], b[1]) for b in buf)
+            return
+        e = torch.linalg.norm(rec[..., :2] - fx[..., :2], dim=-1)  # (B, F)
+        if reduce == "mean":
+            red = e.mean(dim=-1)
+        elif reduce == "max":
+            red = e.amax(dim=-1)
+        elif reduce == "median":
+            red = e.median(dim=-1).values
+        else:
+            red = torch.quantile(e, 0.95, dim=-1)
+        for b, r in zip(buf, red.tolist()):
+            errs.append(r)
+            if r <= max_xy_m:
+                kept.append((b[0], b[1]))
+
+    for scene_id, t0_s in windows:
+        poses = _poses(scene_id)
+        if poses is None:
+            continue
+        try:
+            hx, hr, fx, fr = _ego_traj_from_poses(
+                poses, scene_id, t0_s, num_history_steps, num_future_steps,
+                time_step, min_speed_mps, standstill_snap_mps,
+            )
+        except ValueError:
+            continue
+        buf.append((scene_id, t0_s, hx, hr, fx, fr))
+        if len(buf) >= chunk_size:
+            _flush()
+            buf.clear()
+    _flush()
+
+    if verbose:
+        n_drop = len(windows) - len(kept)
+        e_arr = np.asarray(errs, dtype=np.float64)
+        stats = ""
+        if e_arr.size:
+            stats = (
+                f" [{reduce} recon err: median={np.median(e_arr):.3f}m "
+                f"p95={np.quantile(e_arr, 0.95):.3f}m max={e_arr.max():.3f}m]"
+            )
+        print(
+            f"prefilter_tok_recon: dropped {n_drop}/{len(windows)} windows "
+            f"(threshold {reduce}={max_xy_m:.3f}m){stats}"
+        )
+        if n_fail:
+            print(
+                f"prefilter_tok_recon: {n_fail} windows errored during "
+                "encode/decode and were kept (fail-open)"
+            )
+    return kept
+
+
 # --------------------------------------------------------------------------- #
 # Public entry point
 # --------------------------------------------------------------------------- #
@@ -410,36 +619,10 @@ def load_truckdrive_sample(
     pose_text = be.read_bytes(f"{scene_id}/{pose_file}").decode("utf-8")
     poses = _ScenePoses(pose_text)
 
-    hist_offsets = np.array(
-        [-(num_history_steps - 1 - i) * time_step for i in range(num_history_steps)]
+    hist_xyz, hist_rot, fut_xyz, fut_rot = _ego_traj_from_poses(
+        poses, scene_id, t0_s, num_history_steps, num_future_steps, time_step,
+        min_speed_mps, standstill_snap_mps,
     )
-    fut_offsets = np.array([(i + 1) * time_step for i in range(num_future_steps)])
-    all_offsets = np.concatenate([hist_offsets, fut_offsets])
-    t_window = t0_s + all_offsets
-
-    if t_window[0] < poses.t_min or t_window[-1] > poses.t_max:
-        raise ValueError(
-            f"t0_s={t0_s} leaves the pose timeline [{poses.t_min:.2f}, {poses.t_max:.2f}]s "
-            f"for scene {scene_id} once history/future margins are applied"
-        )
-
-    xyz_w = poses.sample(t_window)
-    yaw_w = _heading_from_positions(xyz_w, time_step, min_speed_mps)
-    rot_w = _rot_z(yaw_w)
-
-    H = num_history_steps
-    t0_xyz = xyz_w[H - 1]
-    t0_rot_inv = rot_w[H - 1].T  # orthonormal -> inverse is transpose
-    xyz_local = (xyz_w - t0_xyz) @ t0_rot_inv.T
-    rot_local = np.einsum("ij,njk->nik", t0_rot_inv, rot_w)
-    hist_xyz, fut_xyz = xyz_local[:H], xyz_local[H:]
-    hist_rot, fut_rot = rot_local[:H], rot_local[H:]
-
-    if standstill_snap_mps is not None:
-        hist_xyz, hist_rot, fut_xyz, fut_rot = _standstill_snap(
-            poses, t0_s, hist_offsets[0], fut_offsets[-1], standstill_snap_mps,
-            hist_xyz, hist_rot, fut_xyz, fut_rot,
-        )
 
     image_time_step = image_time_step if image_time_step is not None else time_step
     img_offsets = np.array([-(num_frames - 1 - i) * image_time_step for i in range(num_frames)])
