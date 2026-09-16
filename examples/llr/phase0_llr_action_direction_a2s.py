@@ -45,11 +45,11 @@ Key differences from the 1.5 script (this repo's own conventions/APIs):
 
 Usage::
 
-    CUDA_VISIBLE_DEVICES=4 .venv/bin/python examples/phase0_llr_action_direction_a2s.py \\
+    CUDA_VISIBLE_DEVICES=4 .venv/bin/python examples/llr/phase0_llr_action_direction_a2s.py \\
       --limit 8 --out /tmp/phase0_llr_act_a2s_smoke.parquet
 
     for i in 0 1 2 3; do
-      CUDA_VISIBLE_DEVICES=$((4+i)) .venv/bin/python examples/phase0_llr_action_direction_a2s.py \\
+      CUDA_VISIBLE_DEVICES=$((4+i)) .venv/bin/python examples/llr/phase0_llr_action_direction_a2s.py \\
         --num_shards 4 --shard_idx $i \\
         --out outputs/phase0_llr_act_a2s/llr.parquet &
     done; wait
