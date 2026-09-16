@@ -7,7 +7,7 @@ prediction uses? Measurement only — no training.
 
 The Alpamayo-1.5 counterpart (and the fuller write-up of method, failure modes,
 and the two-ablation trap) lives in
-`~/repos/alpamayo-recipes/recipes/alpamayo1_x_rl/scripts_fork/llr/`.
+`~/repos/alpamayo-recipes/scripts_fork/llr/`.
 
 | script | what it does |
 |---|---|

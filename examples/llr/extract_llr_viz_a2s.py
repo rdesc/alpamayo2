@@ -2,7 +2,7 @@
 """Camera + BEV + velocity viz assets for Alpamayo-2-Super's 9 min/mean/max llr_act examples.
 
 Mirrors the Alpamayo-1.5 side's alpamayo1_5_v2 asset set (see
-recipes/alpamayo1_x_rl/scripts_fork/extract_llr_viz_predictions_v2.py in the
+scripts_fork/llr/extract_llr_viz_predictions_v2.py in the
 alpamayo-recipes repo for the reference schema/plot style) so both can sit in the same
 published artifact. A2S has a clean, already-validated no-reasoning ablation (drop "cot"
 from components_prompt -- see examples/eval_pai_av_val_a2.py's --no_coc docstring), unlike

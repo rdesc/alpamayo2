@@ -2,7 +2,7 @@
 """Phase-0 LLR diagnostic (langforce_readme.md Sec 4.2, action-direction) for Alpamayo 2 Super.
 
 Ported from the Alpamayo-1.5 version at
-``/mnt/efs/users/rod/repos/alpamayo-recipes/recipes/alpamayo1_x_rl/scripts_fork/
+``/mnt/efs/users/rod/repos/alpamayo-recipes/scripts_fork/llr/
 phase0_llr_action_direction.py`` -- read that file's docstring for the full rationale
 (especially: why this uses NATURAL training order throughout rather than the reordered
 ``[v, a*, cot]`` sequence Sec 4.1 describes, which an earlier control run showed to be ~95%
