@@ -1,7 +1,7 @@
 # Reasoning–action consistency (LLR) diagnostics — Alpamayo 2 Super
 
 Alpamayo-2-Super side of the Phase 0 measurement specified in
-`~/repos/alpamayo-recipes/langforce_readme.md`: does the model's
+`~/repos/alpamayo-recipes/scripts_fork/llr/langforce_readme.md`: does the model's
 Chain-of-Causation reasoning actually carry information its trajectory
 prediction uses? Measurement only — no training.
 
