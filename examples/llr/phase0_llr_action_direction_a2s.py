@@ -3,21 +3,29 @@
 ``README.md``'s "Result" section and
 ``~/repos/alpamayo-recipes/scripts_fork/llr/results/phase0_llr_action_direction.md``.
 
-Two defects, both inherited from the Alpamayo-1.5 script this was ported from:
+ONE defect, inherited from the Alpamayo-1.5 script this was ported from -- and, importantly, NOT
+the worse of the two that script had:
 
-1. It scores via ``loss_future_traj``, a single mean over a span that is NOT just the future
-   trajectory tokens -- it also holds the history-trajectory tokens (history and future share one
-   token-id block, so the mask's id-range test catches them; they precede the cot span, so causal
-   attention pins their LLR to exactly 0 and they purely dilute) and the traj_future delimiters.
+1. SHARED. It scores via ``loss_future_traj``, a single mean over a span that is NOT just the
+   future trajectory tokens -- it also holds the history-trajectory tokens (history and future
+   share one token-id block, so the mask's id-range test catches them; they precede the cot span,
+   so causal attention pins their LLR to exactly 0 and they purely dilute) and the traj_future
+   delimiters.
 
-2. It blanks ``get_label_mask(..., ["cot"])``, whose span is INCLUSIVE of the
-   ``<|cot_start|>``/``<|cot_end|>`` markers. Deleting the end-of-reasoning marker makes the
-   delimiters catastrophically surprising: on Alpamayo 1.5 they went from log p of exactly 0.0 to
-   -18/-28 nats, a near-constant +0.27 on the mean -- more than the entire reported effect, with
-   all apparent spread coming from real tokens scored against a corrupted prefix.
+2. NOT SHARED. The 1.5 script blanked ``get_label_mask(..., ["cot"])``, whose span is INCLUSIVE
+   of the ``<|cot_start|>``/``<|cot_end|>`` markers, so its ablation DELETED the end-of-reasoning
+   marker and drove the delimiters from log p of exactly 0.0 to -18/-28 nats -- a near-constant
+   +0.27 offset, larger than the whole effect it reported. **This script does not do that**: it
+   finds cot_start/cot_end by id and blanks only ``cot_lo:cot_hi``, strictly between them, with
+   both tags left intact. On 1.5 the equivalent interior-only blanking left the delimiters at
+   +4e-6, i.e. no offset.
 
-A2S never needed the pad-blank workaround: ``--no_coc`` is first-class here
-(``components_prompt=["traj_future"]``), which is the correct in-distribution denominator.
+So +0.037 is a role-mixed DILUTION of a real value, not a formatting artifact, and correcting it
+should push the number UP (dropping the structurally-zero history tokens from the mean's
+denominator), not collapse it to ~0 the way 1.5's did. It still needs re-running, because the
+pad-blank denominator remains out of distribution even with the markers intact -- on 1.5, moving
+to a true spliced p(a*|v) shifted the value by ~0.012 nats and flipped its sign. ``--no_coc`` is
+first-class here (``components_prompt=["traj_future"]``) and is the right denominator.
 
 Original docstring follows.
 ---

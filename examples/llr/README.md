@@ -34,33 +34,91 @@ Caveat inherited from that doc: the released expert was trained conditioning on 
 KV-cache that always had CoT tokens before the trajectory, so CoT-off sits
 outside its validated conditioning distribution.
 
-## Result — ⚠️ RETRACTED, pending re-measurement
+## Result: `+0.0179 nats`, 15.4σ — reasoning **is** load-bearing on A2S
 
-Previously reported: `llr_act` mean **+0.037 nats** (median +0.036, range −0.325 → +0.532,
-n = 2,031 / 2,077), positive on every event cluster, "roughly 6× weaker than Alpamayo 1.5's
-+0.227".
+Re-measured with `phase0_llr_per_token_a2s.py --blank-mode splice` over the full OOD reasoning
+split (train+val, 2,071 events, 265,088 scored trajectory tokens):
 
-**Both of those numbers were artifacts of the ablation, not measurements of reasoning.** The
-Alpamayo-1.5 side was diagnosed first and in detail — see
-`~/repos/alpamayo-recipes/scripts_fork/llr/results/phase0_llr_action_direction.md`. Two causes,
-and `phase0_llr_action_direction_a2s.py` shares both because it scores through the same
-`loss_future_traj` mean and blanks the same `get_label_mask(..., ["cot"])` span:
+| | Alpamayo 1.5 | **Alpamayo 2 Super** |
+|---|---|---|
+| corrected `llr_act` | +0.0010 | **+0.0179** |
+| median | +0.0021 | +0.0152 |
+| std | 0.0509 | 0.0528 |
+| fraction > 0 | 54.4% | **69.2%** |
+| distance from 0 | 0.9σ | **15.4σ** |
+| by split | train +0.0006 / val +0.0030 | train +0.0176 / val +0.0193 |
 
-1. **`loss_future_traj` does not score only the future trajectory.** Its span also contains the
-   history-trajectory tokens (same token-id block, so the mask's id-range test catches them) and
-   the `traj_future_start`/`traj_future_end` delimiters. History tokens precede the cot span, so
-   causal attention pins their LLR to exactly 0 — pure dilution.
-2. **Blanking that span deletes `<|cot_start|>`/`<|cot_end|>.`** `get_label_mask` is inclusive of
-   both markers (`get_label_mask.py:45`). On Alpamayo 1.5 this left `<|traj_future_start|>`
-   following an `<|endoftext|>` and drove the delimiters from `log p` of exactly 0.0 to −18/−28
-   nats — a near-constant **+0.27 offset** on the mean, larger than the entire reported effect.
+**This is a real difference between the two models, not the same artifact twice.** Three things
+beyond the sigma support it:
 
-On Alpamayo 1.5, replacing the denominator with a genuine `p(a*|v)` collapsed `+0.227` to
-**about −0.006 nats**, against null controls at exactly 0.0 and positive controls (wrong vision,
-wrong trajectory) at 0.27 and 1.07. Given A2S's `+0.037` is an order of magnitude smaller than
-1.5's retracted figure and was produced by the identical mechanism, it is very likely to be the
-same offset diluted across a longer span — but that is a prediction, not a result, until it is
-re-run.
+- **Channel asymmetry.** Acceleration **+0.0265** vs. curvature **+0.0093** — reasoning informs
+  longitudinal control ~3× more than lateral, which matches the predominantly longitudinal content
+  of the CoC annotations ("slow for…", "stop for…"). On 1.5 both channels were flat
+  (−0.0001 / +0.0021) with no asymmetry at all.
+- **Horizon structure.** +0.032 in the first second decaying to +0.014–0.017 past 5 s, versus
+  1.5's flat ±0.007 noise.
+- **Content, not just presence.** The wrong-prose arm splits the effect: `llr_content` (gold vs.
+  another event's real CoC) = **+0.0110**, `llr_presence` (wrong prose vs. none) = +0.0066. So
+  ~63% comes from the reasoning being *correct for this scene*. On 1.5 the same arm gave −0.008
+  against a +0.001 total — no content signal whatsoever.
+
+Sanity controls (`phase0_llr_verify_setup_a2s.py --limit 24`): reconciliation 2e-7,
+`null_identical` and `history_llr` exactly 0, wrong vision **+0.2785**, wrong trajectory
+**+0.9173**. So reasoning is worth ~6% of what the cameras are worth here, against ~0.4% on 1.5.
+
+**Caveat:** A2S uses a 6-camera input profile and a different training recipe than 1.5's
+4-camera setup. Each model is measured against its own baseline; the ratio between them is not a
+controlled comparison.
+
+### The previously published `+0.037` — what it was
+
+`llr_act` mean +0.037 (median +0.036, range −0.325 → +0.532, n = 2,031 / 2,077), described as
+"roughly 6× weaker than Alpamayo 1.5's +0.227". The direction of that claim was right but the
+basis was inflated ~2×, and its comparison point (1.5's +0.227) was itself an artifact.
+
+**This number is not a measurement of reasoning as it stands, but it is wrong in a different — and
+milder — way than Alpamayo 1.5's was.** The 1.5 side was diagnosed first and in detail (see
+`~/repos/alpamayo-recipes/scripts_fork/llr/results/phase0_llr_action_direction.md`), where two
+defects compounded. **A2S has only the first of them.**
+
+1. **Shared: `loss_future_traj` does not score only the future trajectory.** Its span also
+   contains the history-trajectory tokens (same token-id block, so the mask's id-range test
+   catches them) and the `traj_future_start`/`traj_future_end` delimiters. History tokens precede
+   the cot span, so causal attention pins their LLR to **exactly 0** — they purely dilute the mean.
+
+2. **NOT shared: marker deletion.** On 1.5 the ablation blanked
+   `get_label_mask(..., ["cot"])`, whose span is *inclusive* of `<|cot_start|>`/`<|cot_end|>`
+   (`get_label_mask.py:45`), leaving `<|traj_future_start|>` to follow an `<|endoftext|>`. That
+   drove the delimiters from `log p` of exactly 0.0 to −18/−28 nats — a near-constant **+0.27
+   offset**, larger than the entire effect it reported. **This script does not do that:** it
+   locates `cot_start`/`cot_end` by token id and blanks `cot_lo:cot_hi`, the interior strictly
+   between them, leaving both tags intact (lines 239–252). On 1.5, the equivalent interior-only
+   blanking left the delimiters at +4e-6 — i.e. no offset at all.
+
+**Measured, not inferred** (`phase0_llr_verify_setup_a2s.py`): A2S's id blocks really are disjoint
+— history `[151669, 152669)`, future `[152669, 155669)` — so its mask contains **0 history
+tokens**, and is 130 = 128 future + 2 delimiters. Dilution factor 1.016, against 1.5's 1.391. The
+marker check passes on real token strings: the blanked span `[4581:4596]` is immediately preceded
+by `<|cot_start|>` and followed by `<|cot_end|>`.
+
+**But a third contamination showed up, unique to A2S, and it lives in the delimiters.** Even with
+the markers intact, pad-blanking the interior moves the 2 delimiters by up to **3.95 nats**
+(mean −0.79) — where 1.5's markers-intact blanking left them at 4e-6. And under *splicing* they
+move ~−1.1 nats, enough to drag the 130-token mask-mean to ~+0.000 while the 128 real tokens sit
+at +0.018. So the delimiters have to be excluded either way; the fix is scoring future tokens only,
+not choosing a different denominator.
+
+Measured side by side over the same 24 events:
+
+| basis | mean |
+|---|---|
+| old basis (mask-mean, interior pad-blank) | **+0.0395** ← reproduces the published +0.037 |
+| future-only, interior pad-blank | +0.0277 |
+| **future-only, `cot_text=""` splice** | **+0.0176** |
+| future-only, wrong reasoning prose | +0.0110 |
+
+The old basis reproducing +0.0395 confirms the re-measurement is scoring the same thing the
+original did, and the splice value at n=24 matches the full-split +0.0179.
 
 **A2S has a cleaner fix available than 1.5 did.** `--no_coc` here is already first-class
 (`components_prompt=["traj_future"]`, `pred_coc_ml` genuinely empty — see
