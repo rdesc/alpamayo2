@@ -1,5 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Phase-0 LLR diagnostic (langforce_readme.md Sec 4.2, action-direction) for Alpamayo 2 Super.
+"""SUPERSEDED -- produced the RETRACTED +0.037 nats result. Do not reuse without reading
+``README.md``'s "Result" section and
+``~/repos/alpamayo-recipes/scripts_fork/llr/results/phase0_llr_action_direction.md``.
+
+Two defects, both inherited from the Alpamayo-1.5 script this was ported from:
+
+1. It scores via ``loss_future_traj``, a single mean over a span that is NOT just the future
+   trajectory tokens -- it also holds the history-trajectory tokens (history and future share one
+   token-id block, so the mask's id-range test catches them; they precede the cot span, so causal
+   attention pins their LLR to exactly 0 and they purely dilute) and the traj_future delimiters.
+
+2. It blanks ``get_label_mask(..., ["cot"])``, whose span is INCLUSIVE of the
+   ``<|cot_start|>``/``<|cot_end|>`` markers. Deleting the end-of-reasoning marker makes the
+   delimiters catastrophically surprising: on Alpamayo 1.5 they went from log p of exactly 0.0 to
+   -18/-28 nats, a near-constant +0.27 on the mean -- more than the entire reported effect, with
+   all apparent spread coming from real tokens scored against a corrupted prefix.
+
+A2S never needed the pad-blank workaround: ``--no_coc`` is first-class here
+(``components_prompt=["traj_future"]``), which is the correct in-distribution denominator.
+
+Original docstring follows.
+---
+
+Phase-0 LLR diagnostic (langforce_readme.md Sec 4.2, action-direction) for Alpamayo 2 Super.
 
 Ported from the Alpamayo-1.5 version at
 ``/mnt/efs/users/rod/repos/alpamayo-recipes/scripts_fork/llr/
